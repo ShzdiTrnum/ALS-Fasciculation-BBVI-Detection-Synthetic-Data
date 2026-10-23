@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the paper below."
+title: "ALS-Fasciculation-BBVI-Detection-Synthetic-Data"
+authors:
+  - family-names: Shahzadi
+    given-names: Turrnum
+license: MIT
+repository-code: "https://github.com/ShzdiTrnum/ALS-Fasciculation-BBVI-Detection-Synthetic-Data"
+preferred-citation:
+  type: conference-paper
+  title: "Fasciculation Detection in Ultrasound Images for ALS Diagnosis Based on Black Box Variational Inference"
+  authors:
+    - family-names: Shahzadi
+      given-names: Turrnum
+    - family-names: Zhou
+      given-names: Junfeng
+    - family-names: Bokuda
+      given-names: Kota
+    - family-names: Tagawa
+      given-names: Norio
+  collection-title: "Proceedings of the 21st International Conference on Computer Vision Theory and Applications (VISAPP 2026)"
+  volume: 3
+  start: 688
+  end: 695
+  year: 2026
+  publisher:
+    name: SciTePress
+  doi: "10.5220/0014623000004084"

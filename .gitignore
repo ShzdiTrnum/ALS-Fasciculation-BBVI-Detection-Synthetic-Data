@@ -38,3 +38,11 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Generated outputs (keep outputs/README.md)
+outputs/*
+!outputs/README.md
+
+# Synthetic data and reported results are part of the repository
+!data/*.mp4
+!data/*.csv

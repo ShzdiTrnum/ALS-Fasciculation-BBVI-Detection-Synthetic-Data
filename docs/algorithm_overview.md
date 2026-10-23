@@ -1,138 +1,85 @@
-# Algorithm Overview — BBVI Synthetic Detection
+# Algorithm overview: `src/bbvi_synthetic.py`
 
-## Purpose
+What the code computes, in the order it runs. Section numbers are referenced from the README.
 
-This document explains the algorithm in `bbvi_detection_synthetic.py` and the rationale behind parameter choices specific to the synthetic dataset.
+## 1. Frame pairs and rings
 
----
+* Frames 1–24 are loaded as grayscale in `[0, 1]` and cropped to the ROI (x 240–740, y 124–624).
+* Pairs are `(i, i + FRAME_STEP)`: 23 pairs at step 1, 21 pairs at step 3.
+* Ring *k* holds the pixels whose distance from the **ROI centre** is in `(r_k − Δ/2, r_k + Δ/2]` with
+  `r_k = 10, 30, …, 190` and `Δ = radii[0] = 10`. The rings are therefore 10 px wide with 10 px gaps between
+  them (e.g. 15–25 px); pixels in the gaps, and beyond 195 px, are warped with θ = 0.
 
-## Key Differences from the ALS Pipeline
-
-### 1. Frame Step (`FRAME_STEP = 3`)
-
-The synthetic video rotates rings by ±4° over 40 frames — roughly 0.2°/frame. Pairing frame `i` with frame `i+3` amplifies the apparent rotation to ~0.6°/frame, making it easier for the optimizer to find a meaningful gradient. For real ultrasound (ALS repo), consecutive frames (`FRAME_STEP=1`) suffice because motion is less predictable.
-
-### 2. Ring Configuration
-
-- **Synthetic**: 10 rings, radii 10–190 px (step 20). Matches the ring sizes used in the `optical_flow_synthetic.py` script.
-- **ALS**: 20 rings, radii 5–100 px (step 5). Finer resolution for subtle real motion.
-
-### 3. ROI Size
-
-- **Synthetic**: 500×500 px (`240:740, 124:624`). Covers the full simulated disc region.
-- **ALS**: 250×250 px (`250:500, 200:450`). Tighter crop around the muscle fascicle.
-
-### 4. Initialization CSV Source
-
-For synthetic data, `ring_initial_rotation_values.csv` comes **directly from the simulation** — these are the exact angles used to generate each frame. This means:
-- The BBVI starts from the correct answer
-- Convergence is faster and more stable
-- Residual error after convergence measures the pipeline's precision
-
----
-
-## BBVI + EM Algorithm
-
-### Probabilistic Model
-
-For a frame pair `(f1, f2)`:
+## 2. Observation model
 
 ```
-f1(x) ≈ warp(f2, θ, c) + ε,    ε ~ N(0, σ_n²)
+f1(x) = f2( R(θ_k) (x − c) + c ) + n,   n ~ N(0, σ_n²),   x in ring k,   R(θ) = [[cos θ, −sin θ], [sin θ, cos θ]]
 ```
 
-Where `warp(f2, θ, c)` rotates `f2` by angle `θ_r` around center `c` for each ring `r`.
+`f1` = frame *i*, `f2` = frame *i + step*, warped with `grid_sample` (bilinear, border padding).
 
-### Variational Posterior
+## 3. Posterior
 
-```
-q(θ) = ∏_r N(θ_r | μ_r, σ²_r)
-```
+* **Unstructured** (`STRUCTURED = False`): `q(θ) = Π_k N(μ_k, σ_k²)`, parameters `μ_k, log σ_k²`.
+* **Structured** (`STRUCTURED = True`): `μ = Φ α`, `log σ² = Φ β`, where Φ (10 × U) is an orthonormal DCT-II
+  cosine basis over the ring index (`build_cosine_basis`) and `U = U_BASIS = 5`. Only `α, β` are optimised,
+  so `μ(r)` is smooth in r by construction.
 
-Parameters `{μ_r, log σ²_r}` for `r = 1..10` are optimized per frame pair.
+Samples: `θ^(s) = μ + σ ⊙ ε^(s)`, `ε ~ N(0, I)`, then clipped to `±THETA_CLAMP`.
 
-### E-Step (Variational Update)
+## 4. E-step
 
-Maximize ELBO w.r.t. `{μ_r, log σ²_r}` using reparameterization:
-
-```
-θ^(s) = μ + σ · ε^(s),    ε^(s) ~ N(0, I)
-
-ELBO ≈ -(1/S) Σ_s ||f1 - warp(f2, θ^(s), c)||² / (2σ_n²)
-```
-
-With `S_mc = 10` samples. The mean `μ` is frozen on the first frame pair (initialisation frame).
-
-### M-Step (Center + Noise Update)
-
-Minimize expected squared warping error w.r.t. center `c`:
+Adam on `(μ, log σ²)` or `(α, β)` minimising
 
 ```
-min_c  E_q[||f1 - warp(f2, θ, c)||²]
+loss_E = (1 / 2σ_n²) · (1/S) Σ_s || f1 − warp(f2, θ^(s), c) ||²
 ```
 
-`σ_n` is updated analytically:
+The KL term is set to zero (`kl = 0`), and there is no entropy term, so this is the expected log-likelihood
+part of the ELBO only. The "ELBO" convergence plot shows this quantity.
 
-```
-σ_n² = E_q[||f1 - warp(f2, θ, c)||²] / (H × W)
-```
+## 5. M-step
 
-Fixed after the first frame pair.
+* Adam on the centre `c` with the same expected squared error; after each step `c` is clipped to the box
+  `ROI centre ± CENTER_BOX_PX` (scaled per level).
+* `σ_n² = (1/S) Σ_s ||f1 − warp(f2, θ^(s), c)||² / (H·W)` after every outer iteration.
 
-### Bayesian Prior Fusion (Coarse → Fine)
+## 6. Pyramid, prior fusion, temporal propagation
 
-At each pyramid level transition, the prior for the next finer level is:
+* Levels 0.25 → 0.5 → 1.0. After each level the final mean is clipped to `±THETA_CLAMP`.
+* The level's posterior and the previous-pair posterior are combined by a product of Gaussians and used to
+  **initialise** the next level (for the structured arm, `α, β` are re-fitted to the fused curve by least squares).
+* The finest-level posterior of pair *t* initialises every level of pair *t + 1*; the centre is reset to the
+  ROI centre at the start of each pair.
 
-```
-p(θ) ∝ N(θ | μ_coarse, σ²_coarse) · N(θ | μ_prev_frame, σ²_prev_frame)
-     = N(θ | μ_fused, σ²_fused)
-```
+## 7. Evaluation inside the script
 
-Precision addition:
+* Ground truth per pair: `gt_rel = deg2rad(α(j) − α(i))` from `ring_angles.csv`.
+* Sign: with `GT_SIGN = None`, the sign of the estimate is chosen per run as the one with the lower error on
+  the pairs with the largest true motion. `src/evaluate_runs.py` re-scores with a fixed sign of −1.
+* MAE over all rings, inner five rings (r = 10–90) and outer five rings (r = 110–190); RMSE; centre error
+  = distance between the estimated centre and the true centre of the **source** frame, averaged over pairs.
+* One summary row is appended to `RESULTS_CSV`; the per-pair arrays are saved to `PERPAIR_DIR/<arm>_step<k>.npz`
+  (overwritten by the next run of the same arm and step).
 
-```
-1/σ²_fused = 1/σ²_coarse + 1/σ²_prev_frame
-μ_fused    = σ²_fused · (μ_coarse/σ²_coarse + μ_prev_frame/σ²_prev_frame)
-```
+## 8. Why the inner rings are hard in this video
 
-### Temporal Propagation
+`generate_synthetic_video.py` renders each frame by rotating every ring about the fixed point (490, 374) and
+then translating the whole pattern so it is centred on the drifting point in `ring_center_positions.csv`,
+which moves from (490, 374) to (499, 380) over frames 3–9 and back over frames 16–22, i.e. during the same
+frames as the rotation. The recorded centre is therefore where the pattern is, not a fixed pivot of the
+frame-to-frame motion, so the centre error measures distance to the pattern centre. Between two frames the
+content therefore rotates *and* translates by about 1.5 px. For an inner ring (r = 10 px) a 0.04 rad rotation
+moves pixels by only 0.4 px, so the translation dominates; a pure rotation about one centre cannot represent
+it, and a per-ring grid search over θ on the raw frames gives the opposite sign for ring 0 than for the outer
+rings. The outer rings (r ≥ 90 px), where rotation dominates, are consistent with `θ = −Δα`.
 
-The finest-level posterior `(μ_fin, log σ²_fin)` from pair `t` seeds all pyramid levels of pair `t+1`.
+## 9. Differences from the manuscript description
 
----
-
-## Warping Implementation
-
-Rotation warping uses `torch.nn.functional.grid_sample` with bilinear interpolation:
-
-```
-x_src = cos(θ)·(x - cx) - sin(θ)·(y - cy) + cx
-y_src = sin(θ)·(x - cx) + cos(θ)·(y - cy) + cy
-```
-
-Grid normalized to `[-1, 1]` as required by `grid_sample`.
-
----
-
-## Zoomed Inset COR Plot
-
-The centre-of-rotation (COR) trajectory uses `mpl_toolkits.axes_grid1.inset_locator`:
-
-- `zoomed_inset_axes`: creates a magnified inset panel
-- `mark_inset`: draws dashed connecting lines from the zoomed region to the inset
-- Each point is annotated with its source frame index
-
-This is particularly useful for synthetic data where the simulated COR drift is small (≈30 px) and hard to see on a full-ROI plot.
-
----
-
-## Output Diagnostics
-
-| Plot | What to check |
-|------|--------------|
-| Rotation angle vs frame | Should follow the known ±4° sweep pattern from the simulation |
-| ELBO | Should increase within each level; plateau = convergence |
-| MSE | Should decrease; final value reflects residual noise floor |
-| Noise variance | Should stabilize after first pair |
-| Posterior variance | Should decrease over pairs as the posterior sharpens |
-| COR trajectory | Should stay near the simulated center drift path |
+| Manuscript | Code |
+|---|---|
+| ELBO with KL to the fused prior | KL term omitted (§4) |
+| Fused Gaussian used as the prior | Used as the initialisation (§6) |
+| Basis functions of the warped intensities (Eq. 17) | Cosine basis over the ring index (§3) |
+| Radius measured from the estimated centre | Rings fixed around the ROI centre (§1) |
+| Single reported MAE | Best of four unstructured runs; see `evaluate_runs.py` for mean ± sd |
